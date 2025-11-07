@@ -256,12 +256,8 @@ async def call_llm(prompt: str, model: str = "gpt-4o", temperature: float = 0.3)
 
 def run_research(question: str) -> str:
     research = ""
-    if ASKNEWS_CLIENT_ID and ASKNEWS_SECRET:
-        research = call_asknews(question)
-    elif EXA_API_KEY:
-        research = call_exa_smart_searcher(question)
-    elif PERPLEXITY_API_KEY:
-        research = call_perplexity(question)
+    if PERPLEXITY_API_KEY:
+        research = call_perplexity_with_cutoff_test(question)
     else:
         research = "No research done"
 
@@ -278,7 +274,7 @@ def call_perplexity(question: str) -> str:
         "content-type": "application/json",
     }
     payload = {
-        "model": "llama-3.1-sonar-huge-128k-online",
+        "model": "sonar",
         "messages": [
             {
                 "role": "system",  # this is a system prompt designed to guide the perplexity assistant
@@ -300,6 +296,66 @@ def call_perplexity(question: str) -> str:
         raise Exception(response.text)
     content = response.json()["choices"][0]["message"]["content"]
     return content
+
+def call_perplexity_with_cutoff_test(question: str, cutoff_date: str = "2023-10-01") -> str:
+    api_key = PERPLEXITY_API_KEY
+    url = "https://api.perplexity.ai/chat/completions"
+    headers = {
+        "accept": "application/json",
+        "authorization": f"Bearer {api_key}",
+        "content-type": "application/json",
+    }
+
+    cutoff_prompt = f"""
+You are a research assistant constrained to knowledge available only up to {cutoff_date}.
+Do not reference or cite any source published after that date.
+If you find yourself citing an article, explicitly include the publication date in parentheses.
+Question: {question}
+"""
+    unrestricted_prompt = f"""
+You are a research assistant with full access to the web and recent sources.
+If you cite sources, include the publication date in parentheses.
+Question: {question}
+"""
+
+    def perplexity_request(prompt: str):
+        payload = {
+            "model": "sonar",
+            "messages": [
+                {"role": "system",
+                "content": "You are a concise, factual assistant for superforecasters, summarizing the latest news and facts relevant to the given question."},
+                {"role": "user", "content": prompt},
+            ],
+        }
+        response = requests.post(url=url, json=payload, headers=headers)
+        if not response.ok:
+            raise Exception(response.text)
+        return response.json()["choices"][0]["message"]["content"]
+
+    cutoff_answer = perplexity_request(cutoff_prompt)
+    unrestricted_answer = perplexity_request(unrestricted_prompt)
+
+    timestamp = datetime.now().isoformat()
+    csv_file = "perplexityLeakage.csv"
+    
+    with open(csv_file, "a", encoding="utf-8") as f:
+        f.write(
+            f"{timestamp},\"{question.replace('\"','')}\","
+            f"\"{cutoff_date}\","
+            f"\"{cutoff_answer.replace('\"','')}\","
+            f"\"{unrestricted_answer.replace('\"','')}\"\n"
+        )
+
+    print(f"\n[LeakTest] Question: {question}")
+    print(f"WITH_CUTOFF ({cutoff_date}):\n{cutoff_answer[:800]}")
+    print(f"WITHOUT_CUTOFF:\n{unrestricted_answer[:800]}")
+
+    with open("perplexityLog.txt", "a", encoding="utf-8") as trace_log:
+        trace_log.write(f"Timestamp: {timestamp}\nQuestion: {question}\n\n")
+        trace_log.write(f"WITH_CUTOFF ({cutoff_date}):\n{cutoff_answer}\n\n")
+        trace_log.write(f"WITHOUT_CUTOFF:\n{unrestricted_answer}\n")
+
+    return f"WITH_CUTOFF ({cutoff_date}):\n{cutoff_answer}\n\nWITHOUT_CUTOFF:\n{unrestricted_answer}\n"
 
 def call_exa_smart_searcher(question: str) -> str:
     if OPENAI_API_KEY is None:
@@ -1091,20 +1147,35 @@ async def forecast_questions(
         raise RuntimeError(error_message)
 
 
+def getQuestions(limit: int = 20) -> list[tuple[int, int]]:
+    url = f"{API_BASE_URL}/posts/"
+    params = {
+        "limit": limit,
+        "order_by": "-publish_time",
+        "statuses": "resolved",
+        "forecast_type": "binary,multiple_choice,numeric,discrete",
+        "include_description": "true",
+    }
+    response = requests.get(url, **AUTH_HEADERS, params=params)
+    if not response.ok:
+        raise Exception(response.text)
 
+    data = response.json()
+    resolved_pairs = []
+    for post in data["results"]:
+        if question := post.get("question"):
+            resolved_pairs.append((question["id"], post["id"]))
+    return resolved_pairs
 
-######################## FINAL RUN #########################
 if __name__ == "__main__":
-    if USE_EXAMPLE_QUESTIONS:
-        open_question_id_post_id = EXAMPLE_QUESTIONS
-    else:
-        open_question_id_post_id = get_open_question_ids_from_tournament()
-
+    print(f"getting 50 resolved questions for testing leakage")
+    question_id_post_id = getQuestions(50)
+    print(f"\nFound {len(question_id_post_id)} resolved questions")
     asyncio.run(
         forecast_questions(
-            open_question_id_post_id,
-            SUBMIT_PREDICTION,
-            NUM_RUNS_PER_QUESTION,
-            SKIP_PREVIOUSLY_FORECASTED_QUESTIONS,
+            question_id_post_id,
+            submit_prediction=False,  # don’t publish
+            num_runs_per_question=1,  # reduce load
+            skip_previously_forecasted_questions=False,
         )
     )
